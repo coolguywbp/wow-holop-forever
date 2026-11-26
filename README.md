@@ -8,6 +8,24 @@
 
 Холоп крафтит за вас, закупает материалы у торговца, продаёт продукцию торговцу и помогает купить материалы на аукционе так, чтобы крафт остался в плюсе. Он считает будущую прибыль и зовёт вас, если без нажатия кнопки крафт дальше не пойдёт.
 
+## Установка в WoW Forever
+
+Холоп ставится только в клиент **World of Warcraft: Forever**. Папка обычного WoW, Classic или Era его не загрузит.
+
+1. Скачайте архив: [wow-holop-forever-main.zip](https://github.com/coolguywbp/wow-holop-forever/archive/refs/heads/main.zip).
+2. Распакуйте его. Внутри будет папка `wow-holop-forever-main`. Переименуйте её в `Holop`.
+3. В этой папке файл `Holop.toc` должен лежать сразу, а не в ещё одной вложенной папке `Holop`.
+4. Скопируйте папку `Holop` сюда:
+
+`World of Warcraft\_forever_\Interface\AddOns\Holop`
+
+Если папки `Interface\AddOns` ещё нет, создайте её. Установленный клиент выглядит так: `_forever_\Interface\AddOns\Holop\Holop.toc`.
+
+5. Полностью перезапустите клиент Forever. На экране выбора персонажа откройте **Аддоны** и включите **Холоп**.
+6. Войдите в игру и проверьте: `/holop list` открывает списки.
+
+Позже, чтобы обновить аддон, замените папку `Holop` новой и в игре напишите `/reload`.
+
 ## Что умеет
 
 - Крафтит предметы из списка **Производить**. Один рецепт делается до конца, затем Холоп зовёт: **Хозяиииииин**. Дальше нужно нажать **Начать**. Сам он персонажа не водит.
@@ -63,3 +81,5 @@
 Holop is a World of Warcraft: Forever addon for profitable crafting. It crafts from your list, buys reagents from vendors, sells finished goods to vendors, and shows the auction prices that still leave a profit. It forecasts the payout and calls you when the next craft needs a click.
 
 Green prices are above 20% return, yellow is 0–20%, and red is break-even or a loss. Cooking includes the Master Chef legacy talent.
+
+Install it only in the Forever client. Download the repository zip, rename the unpacked folder to `Holop`, and copy it to `World of Warcraft\_forever_\Interface\AddOns\Holop`. `Holop.toc` must sit directly in that folder. Restart the client once, enable Holop in the addons list, then type `/holop list`.
