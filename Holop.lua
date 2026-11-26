@@ -15,6 +15,8 @@ local planIndex = 1
 local DB
 local BuildPlan
 local RefreshMoney
+local RequestRestock
+local StartMerchantWork
 local current = nil
 local bar = nil
 local lastCast = 0
@@ -733,30 +735,7 @@ function RefreshMoney()
     if earnUnknown then
         earnText = earnText .. " + ?"
     end
-    bar.earn:SetText(L("Заработаю: ", "I'll earn: ") .. earnText)
-    local cost = 0
-    local unknown = false
-    local prices = DB().buyPrice or {}
-    for key, amount in pairs(DB().restock or {}) do
-        local id = tonumber(key)
-        local want = tonumber(amount) or 0
-        if id and want > 0 then
-            local need = want - ItemCount(id)
-            if need > 0 then
-                local price = prices[id] or prices[tostring(id)]
-                if type(price) == "number" and price > 0 then
-                    cost = cost + price * need
-                else
-                    unknown = true
-                end
-            end
-        end
-    end
-    local costText = MoneyText(cost)
-    if unknown then
-        costText = costText .. " + ?"
-    end
-    bar.spend:SetText(L("Закуплю: ", "I'll buy: ") .. costText)
+    bar.earn:SetText(L("На продажу: ", "For sale: ") .. earnText)
     local queued, queueUnknown, cooking, rank, chefRead = QueueValue()
     local forecastText = MoneyText(earn + queued)
     if earnUnknown or queueUnknown then
@@ -999,6 +978,31 @@ local function MakeColumn(parent, kind, title, anchor)
     local hint = box:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     hint:SetPoint("TOPLEFT", 8, -26)
     hint:SetText(L("Перетащи предмет сюда", "Drop an item here"))
+    local rowTop = -46
+    if kind == "restock" then
+        hint:Hide()
+        local check = CreateFrame("CheckButton", nil, box, "UICheckButtonTemplate")
+        check:SetSize(24, 24)
+        check:SetPoint("TOPLEFT", 4, -22)
+        check:SetChecked(DB().alwaysRestock == true)
+        check:SetScript("OnClick", function(self)
+            DB().alwaysRestock = self:GetChecked() and true or false
+        end)
+        local checkLabel = box:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        checkLabel:SetPoint("LEFT", check, "RIGHT", 0, 0)
+        checkLabel:SetText(L("Всегда закупать", "Always buy"))
+        local buyNow = CreateFrame("Button", nil, box, "UIPanelButtonTemplate")
+        buyNow:SetSize(78, 20)
+        buyNow:SetPoint("TOPRIGHT", -6, -24)
+        buyNow:SetFrameStrata("TOOLTIP")
+        buyNow:SetFrameLevel(400)
+        buyNow:RegisterForClicks("LeftButtonUp")
+        buyNow:SetText(L("Закупить", "Buy"))
+        buyNow:SetScript("OnClick", function()
+            RequestRestock()
+        end)
+        rowTop = -50
+    end
     box:EnableMouse(true)
     box:EnableMouseWheel(true)
     box:SetScript("OnReceiveDrag", function()
@@ -1019,7 +1023,7 @@ local function MakeColumn(parent, kind, title, anchor)
     box.rows = {}
     for i = 1, 8 do
         local row = MakeDropRow(parent, kind)
-        row:SetPoint("TOPLEFT", box, "TOPLEFT", 8, -46 - ((i - 1) * 26))
+        row:SetPoint("TOPLEFT", box, "TOPLEFT", 8, rowTop - ((i - 1) * 26))
         row:SetFrameStrata("TOOLTIP")
         row:SetFrameLevel(200)
         box.rows[i] = row
@@ -1280,16 +1284,19 @@ local function EconomyEntries()
                         }
                         if othersKnown then
                             entry.ready = true
-                            entry.green = MaxPriceAbove(revenue, others, row.qty, 0.20)
-                            entry.yellow = MaxPriceAbove(revenue, others, row.qty, 0)
-                            if entry.yellow then
-                                entry.redFrom = entry.yellow + 1
+                            entry.green = MaxPriceAbove(revenue, others, row.qty, 0.30)
+                            entry.yellow = MaxPriceAbove(revenue, others, row.qty, 0.15)
+                            entry.orange = MaxPriceAbove(revenue, others, row.qty, 0)
+                            if entry.orange then
+                                entry.redFrom = entry.orange + 1
                             end
                             if row.auction then
                                 if entry.green and row.auction <= entry.green then
                                     entry.zone = "green"
                                 elseif entry.yellow and row.auction <= entry.yellow then
                                     entry.zone = "yellow"
+                                elseif entry.orange and row.auction <= entry.orange then
+                                    entry.zone = "orange"
                                 else
                                     entry.zone = "red"
                                 end
@@ -1312,9 +1319,52 @@ local function FillZone(box, caption, priceText)
     box:Show()
 end
 
+local greenPosted = {}
+local zoneCounts = {}
+local qtyWant = {}
+
+local function RegistryEntries()
+    local buys, notes, seen = {}, {}, {}
+    for _, entry in ipairs(EconomyEntries()) do
+        if entry.kind == "buy" and entry.itemID then
+            local prev = seen[entry.itemID]
+            if not prev then
+                seen[entry.itemID] = entry
+                buys[#buys + 1] = entry
+            else
+                if entry.green and (not prev.green or entry.green < prev.green) then
+                    prev.green = entry.green
+                end
+                if entry.yellow and (not prev.yellow or entry.yellow < prev.yellow) then
+                    prev.yellow = entry.yellow
+                end
+                if entry.orange and (not prev.orange or entry.orange < prev.orange) then
+                    prev.orange = entry.orange
+                end
+            end
+        elseif entry.kind ~= "craft" then
+            notes[#notes + 1] = entry
+        end
+    end
+    table.sort(buys, function(a, b)
+        local ag = greenPosted[a.itemID]
+        local bg = greenPosted[b.itemID]
+        if ag == nil then ag = -1 end
+        if bg == nil then bg = -1 end
+        if ag ~= bg then return ag > bg end
+        return (a.title or "") < (b.title or "")
+    end)
+    if #buys == 0 then
+        for _, entry in ipairs(notes) do
+            buys[#buys + 1] = entry
+        end
+    end
+    return buys
+end
+
 local function RefreshEconomy()
     if not listFrame or not listFrame.economy or listFrame.mode ~= "economy" then return end
-    local entries = EconomyEntries()
+    local entries = RegistryEntries()
     local view = listFrame.economy.rows
     local offset = listFrame.economyOffset or 0
     local maxOff = math.max(0, #entries - #view)
@@ -1327,6 +1377,7 @@ local function RefreshEconomy()
             row:Hide()
         else
             row.itemID = entry.itemID
+            row.greenCap = entry.green
             row:Show()
             local icon = entry.itemID and ItemIcon(entry.itemID)
             if icon then
@@ -1336,57 +1387,116 @@ local function RefreshEconomy()
                 row.icon:Hide()
             end
             row.title:SetText(entry.title or "")
-            local detail = entry.detail or ""
-            if entry.auction then
-                detail = detail .. "   " .. L("сейчас ", "now ") .. MoneyText(entry.auction)
+            local buying = entry.kind == "buy" and (entry.green or entry.yellow or entry.orange)
+            row.price:SetShown(buying)
+            row.qty:SetShown(buying)
+            row.buy:SetShown(buying)
+            for _, cell in ipairs(row.zones) do
+                cell:SetShown(buying)
             end
-            row.detail:SetText(detail)
-            if entry.zone == "green" then
-                row.detail:SetTextColor(0.45, 0.95, 0.45)
-            elseif entry.zone == "yellow" then
-                row.detail:SetTextColor(1, 0.85, 0.3)
-            elseif entry.zone == "red" then
-                row.detail:SetTextColor(1, 0.4, 0.32)
-            else
-                row.detail:SetTextColor(0.8, 0.75, 0.6)
-            end
-            if entry.kind == "buy" and (entry.green or entry.yellow or entry.redFrom or not entry.zone) then
-                local greenText = entry.green and (L("до ", "up to ") .. MoneyText(entry.green)) or L("нет", "none")
-                local yellowText = entry.yellow and (L("до ", "up to ") .. MoneyText(entry.yellow)) or L("нет", "none")
-                local redText = entry.redFrom and (L("от ", "from ") .. MoneyText(entry.redFrom)) or L("любая цена", "any price")
-                if not entry.green and not entry.yellow and not entry.redFrom then
-                    if entry.ready then
-                        greenText = L("нет", "none")
-                        yellowText = L("нет", "none")
-                        redText = L("не покупать", "do not buy")
-                    else
-                        greenText = "—"
-                        yellowText = "—"
-                        redText = L("жду цену", "need a price")
+            if buying then
+                row.price:SetText(entry.green and (L("до ", "up to ") .. MoneyText(entry.green)) or L("зелёного нет", "no green"))
+                local posted = greenPosted[entry.itemID]
+                local zones = zoneCounts[entry.itemID]
+                if not zones then
+                    for _, cell in ipairs(row.zones) do
+                        cell:SetText("—")
                     end
-                end
-                FillZone(row.green, L("выше 20%", "above 20%"), greenText)
-                FillZone(row.yellow, "0–20%", yellowText)
-                FillZone(row.red, L("убыток", "loss"), redText)
-                if entry.zone == "green" then
-                    row.bar:SetColorTexture(0.2, 0.65, 0.25, 1)
-                elseif entry.zone == "yellow" then
-                    row.bar:SetColorTexture(0.75, 0.6, 0.1, 1)
-                elseif entry.zone == "red" then
-                    row.bar:SetColorTexture(0.7, 0.15, 0.12, 1)
-                else
                     row.bar:SetColorTexture(0.35, 0.28, 0.16, 1)
+                else
+                    row.zones[1]:SetText(zones.green)
+                    row.zones[2]:SetText(zones.yellow)
+                    row.zones[3]:SetText(zones.orange or 0)
+                    row.zones[4]:SetText(zones.red)
+                    row.bar:SetColorTexture(posted > 0 and 0.2 or 0.45, posted > 0 and 0.65 or 0.15, posted > 0 and 0.25 or 0.12, 1)
                 end
-                row.now:Hide()
+                if not row.qty:HasFocus() then
+                    row.filling = true
+                    local want = qtyWant[entry.itemID]
+                    if want == nil then want = posted end
+                    row.qty:SetText(want and tostring(want) or "")
+                    row.filling = false
+                end
+                row.buy:SetEnabled(posted ~= nil and posted > 0)
             else
-                row.green:Hide()
-                row.yellow:Hide()
-                row.red:Hide()
-                row.now:Hide()
+                row.title:SetText((entry.title or "") .. (entry.detail and entry.detail ~= "" and ("  " .. entry.detail) or ""))
                 row.bar:SetColorTexture(0.55, 0.43, 0.25, 1)
             end
         end
     end
+end
+
+local SHOPPING_LIST = "Холоп"
+
+local function AuctionBuyNames()
+    local seen = {}
+    local names = {}
+    for key in pairs(DB().craft or {}) do
+        local itemID = tonumber(key)
+        local recipe = itemID and RecipeForOutput(itemID)
+        if recipe then
+            for _, reagent in ipairs(recipe.reagents or {}) do
+                local id = tonumber(reagent.id)
+                local qty = tonumber(reagent.qty) or 0
+                if id and qty > 0 and not seen[id] and not VendorUnit(id) then
+                    local name = ItemName(id)
+                    if type(name) == "string" and not name:match("^#%d+$") and not name:find("[;^\"']") then
+                        seen[id] = true
+                        names[#names + 1] = name
+                    end
+                end
+            end
+        end
+    end
+    table.sort(names)
+    return names
+end
+
+local function SearchAuctionList()
+    if not (Auctionator and Auctionator.API and Auctionator.API.v1 and Auctionator.API.v1.CreateShoppingList) then
+        Print(L("Auctionator не найден.", "Auctionator is not installed."))
+        return
+    end
+    local names = AuctionBuyNames()
+    if #names == 0 then
+        Print(L("На аукцион покупать нечего. Открой профессию, чтобы запомнить рецепты.", "Nothing to buy at auction. Open the profession so recipes are saved."))
+        return
+    end
+    local terms = {}
+    for _, name in ipairs(names) do
+        local term = "\"" .. name .. "\""
+        if Auctionator.API.v1.ConvertToSearchString then
+            local ok, built = pcall(Auctionator.API.v1.ConvertToSearchString, "Holop", {
+                searchString = name,
+                isExact = true,
+                categoryKey = "",
+            })
+            if ok and type(built) == "string" and built ~= "" then
+                term = built
+            end
+        end
+        terms[#terms + 1] = term
+    end
+    if AuctionatorTabs_Shopping and AuctionatorTabs_Shopping.Click then
+        AuctionatorTabs_Shopping:Click()
+    end
+    C_Timer.After(0.1, function()
+        local ok, err = pcall(Auctionator.API.v1.CreateShoppingList, "Holop", SHOPPING_LIST, terms)
+        if not ok then
+            Print(L("Список не создался: ", "The list was not created: ") .. tostring(err))
+            return
+        end
+        local auto = false
+        if Auctionator.Config and Auctionator.Config.Get and Auctionator.Config.Options then
+            local readOk, value = pcall(Auctionator.Config.Get, Auctionator.Config.Options.AUTO_LIST_SEARCH)
+            auto = readOk and value and true or false
+        end
+        local list = Auctionator.Shopping and Auctionator.Shopping.ListManager and Auctionator.Shopping.ListManager:GetByName(SHOPPING_LIST)
+        if not auto and list and AuctionatorShoppingFrame and AuctionatorShoppingFrame.DoSearch then
+            pcall(AuctionatorShoppingFrame.DoSearch, AuctionatorShoppingFrame, list:GetAllItems())
+        end
+        Print(L("Список «Холоп»: " .. #terms .. ".", "Holop list: " .. #terms .. "."))
+    end)
 end
 
 local function ShowListsMode(mode)
@@ -1416,6 +1526,20 @@ local function ShowListsMode(mode)
     if listFrame.dump then
         listFrame.dump:SetShown(not economy)
     end
+    if listFrame.search then
+        listFrame.search:SetShown(economy)
+    end
+    if listFrame.refresh then
+        listFrame.refresh:SetShown(economy)
+    end
+    if listFrame.autoCheck then
+        listFrame.autoCheck:SetShown(economy)
+        listFrame.autoLabel:SetShown(economy)
+        listFrame.autoTimer:SetShown(economy)
+    end
+    if economy and DB().autoScan then
+        EnsureAutoTicker()
+    end
     if listFrame.tabLists then
         listFrame.tabLists:SetText((economy and "" or "|cffffd100") .. L("Списки", "Lists") .. (economy and "" or "|r"))
         listFrame.tabEconomy:SetText((economy and "|cffffd100" or "") .. L("Экономика", "Economy") .. (economy and "|r" or ""))
@@ -1428,14 +1552,276 @@ local function ShowListsMode(mode)
     end
 end
 
+local function OpenEconomy(atAuction)
+    if not listFrame then return end
+    if not atAuction and listFrame:IsShown() and listFrame.mode == "economy" then
+        listFrame:Hide()
+        return
+    end
+    if atAuction then
+        listFrame:ClearAllPoints()
+        listFrame:SetPoint("TOPRIGHT", UIParent, "TOPRIGHT", -12, -60)
+    end
+    listFrame:Show()
+    listFrame:Raise()
+    ShowListsMode("economy")
+end
+
+local scanQueue, scanPos, scanJob, buyAfterScan, scanQuiet
+local autoNext = 0
+local autoTicker
+local buyQueue, buyJob
+
+local function GreenTargets()
+    local list = {}
+    for _, entry in ipairs(RegistryEntries()) do
+        if entry.kind == "buy" and entry.itemID and (entry.green or entry.yellow or entry.orange) then
+            list[#list + 1] = { itemID = entry.itemID, cap = entry.green, yellow = entry.yellow, orange = entry.orange, name = entry.title }
+        end
+    end
+    return list
+end
+
+local function AddZone(zones, unit, qty, cap, yellow, orange)
+    if not unit or not qty or qty < 1 then return end
+    if cap and unit <= cap then
+        zones.green = zones.green + qty
+    elseif yellow and unit <= yellow then
+        zones.yellow = zones.yellow + qty
+    elseif orange and unit <= orange then
+        zones.orange = zones.orange + qty
+    else
+        zones.red = zones.red + qty
+    end
+end
+
+local function CountZones(itemID, itemKey, cap, yellow, orange)
+    local zones = { green = 0, yellow = 0, orange = 0, red = 0 }
+    if C_AuctionHouse.GetNumCommoditySearchResults then
+        local ok, count = pcall(C_AuctionHouse.GetNumCommoditySearchResults, itemID)
+        if ok and type(count) == "number" and count > 0 then
+            for index = 1, count do
+                local info = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, index)
+                if info and info.unitPrice and not info.containsOwnerItem then
+                    AddZone(zones, info.unitPrice, info.quantity, cap, yellow, orange)
+                end
+            end
+            return zones
+        end
+    end
+    if itemKey and C_AuctionHouse.GetNumItemSearchResults then
+        local ok, count = pcall(C_AuctionHouse.GetNumItemSearchResults, itemKey)
+        if ok and type(count) == "number" and count > 0 then
+            for index = 1, count do
+                local info = C_AuctionHouse.GetItemSearchResultInfo(itemKey, index)
+                if info and info.buyoutAmount and info.quantity and info.quantity > 0 and not info.containsOwnerItem then
+                    AddZone(zones, math.floor(info.buyoutAmount / info.quantity), info.quantity, cap, yellow, orange)
+                end
+            end
+        end
+    end
+    return zones
+end
+
+local function ScanNext()
+    local job = scanQueue and scanQueue[scanPos]
+    if not job then
+        scanJob = nil
+        scanQueue = nil
+        autoNext = GetTime() + 3
+        if not scanQuiet then
+            Print(L("Зелёная зона посчитана.", "Green zone counted."))
+        end
+        if buyAfterScan then
+            buyAfterScan = false
+            BuyAllGreen()
+        end
+        if UpdateAutoTimer then UpdateAutoTimer() end
+        return
+    end
+    if not (C_AuctionHouse and C_AuctionHouse.SendSearchQuery and C_AuctionHouse.MakeItemKey) then
+        Print(L("Аукцион недоступен.", "The auction house is not available."))
+        scanQueue, scanJob, buyAfterScan = nil, nil, false
+        return
+    end
+    local key = C_AuctionHouse.MakeItemKey(job.itemID)
+    scanJob = { itemID = job.itemID, cap = job.cap, yellow = job.yellow, orange = job.orange, key = key, name = job.name }
+    local sorts = Auctionator and Auctionator.Constants and Auctionator.Constants.CommodityResultsSorts
+        or { { sortOrder = 0, reverseSort = false } }
+    local ok = pcall(C_AuctionHouse.SendSearchQuery, key, sorts, false)
+    if not ok then
+        C_Timer.After(0.6, ScanNext)
+    end
+end
+
+local function UpdateAutoTimer()
+    if not listFrame or not listFrame.autoTimer then return end
+    local shown = listFrame.mode == "economy" and listFrame:IsShown()
+    if not shown or DB().autoScan ~= true then
+        listFrame.autoTimer:SetText("")
+        return
+    end
+    local scanning = scanJob or (scanQueue and scanQueue[scanPos])
+    if listFrame.refreshAnim then
+        if scanning then
+            if not listFrame.refreshAnim:IsPlaying() then
+                listFrame.refreshAnim:Play()
+            end
+        elseif listFrame.refreshAnim:IsPlaying() then
+            listFrame.refreshAnim:Stop()
+        end
+    end
+    if scanning then
+        listFrame.autoTimer:SetText(L("обновляю", "updating"))
+        return
+    end
+    local left = math.ceil((autoNext or 0) - GetTime())
+    if left < 0 then left = 0 end
+    listFrame.autoTimer:SetText(left .. L(" с", " s"))
+end
+
+local function AutoScanTick()
+    local shown = listFrame and listFrame.mode == "economy" and listFrame:IsShown()
+    local scanning = scanJob or (scanQueue and scanQueue[scanPos])
+    if shown and DB().autoScan == true and not scanning and GetTime() >= (autoNext or 0) then
+        autoNext = GetTime() + 3
+        StartGreenScan(false, true)
+    end
+    UpdateAutoTimer()
+end
+
+function EnsureAutoTicker()
+    if autoTicker then return end
+    autoTicker = C_Timer.NewTicker(0.2, AutoScanTick)
+end
+
+function StartGreenScan(thenBuy, quiet)
+    if scanJob or (scanQueue and scanQueue[scanPos]) then return end
+    scanQueue = GreenTargets()
+    scanPos = 1
+    scanQuiet = quiet and true or false
+    buyAfterScan = thenBuy and true or false
+    if #scanQueue == 0 then
+        scanQueue = nil
+        autoNext = GetTime() + 3
+        if not scanQuiet then
+            Print(L("В зелёной зоне покупать нечего.", "Nothing to buy in the green zone."))
+        end
+        buyAfterScan = false
+        return
+    end
+    ScanNext()
+end
+
+local function FinishBuy(message)
+    if buyJob then buyJob.done = true end
+    if message then Print(message) end
+    buyJob = nil
+    C_Timer.After(0.3, BuyNext)
+end
+
+function BuyNext()
+    local job = buyQueue and table.remove(buyQueue, 1)
+    if not job then
+        buyQueue = nil
+        Print(L("Зелёная зона выкуплена.", "Green zone bought."))
+        return
+    end
+    if job.qty < 1 then
+        BuyNext()
+        return
+    end
+    job.done = false
+    buyJob = job
+    local ok, err = pcall(C_AuctionHouse.StartCommoditiesPurchase, job.itemID, job.qty)
+    if not ok then
+        FinishBuy((job.name or "") .. " " .. tostring(err))
+        return
+    end
+    C_Timer.After(3, function()
+        if buyJob == job and not job.done then
+            pcall(C_AuctionHouse.CancelCommoditiesPurchase)
+            FinishBuy((job.name or "") .. " " .. L("аукцион не ответил.", "the auction house did not answer."))
+        end
+    end)
+end
+
+local function QueueBuys(jobs)
+    if buyJob or buyQueue then
+        Print(L("Выкуп уже идёт.", "A buy is already running."))
+        return
+    end
+    buyQueue = jobs
+    BuyNext()
+end
+
+function BuyOneGreen(itemID, qty, cap, name)
+    if not itemID or not cap or qty < 1 then return end
+    local posted = greenPosted[itemID]
+    if posted and qty > posted then qty = posted end
+    if qty < 1 then return end
+    QueueBuys({ { itemID = itemID, qty = qty, cap = cap, name = name } })
+end
+
+function BuyAllGreen()
+    if not next(greenPosted) then
+        StartGreenScan(true)
+        return
+    end
+    local jobs = {}
+    for _, target in ipairs(GreenTargets()) do
+        local qty = qtyWant[target.itemID]
+        if qty == nil then qty = greenPosted[target.itemID] or 0 end
+        if qty > 0 then
+            jobs[#jobs + 1] = { itemID = target.itemID, qty = qty, cap = target.cap, name = target.name }
+        end
+    end
+    if #jobs == 0 then
+        Print(L("В зелёной зоне пусто.", "The green zone is empty."))
+        return
+    end
+    QueueBuys(jobs)
+end
+
+local function OnAuctionSearch(itemID, itemKey)
+    if not scanJob then return end
+    local same = itemID and itemID == scanJob.itemID
+    if not same and type(itemKey) == "table" and itemKey.itemID == scanJob.itemID then
+        same = true
+    end
+    if not same then return end
+    local zones = CountZones(scanJob.itemID, scanJob.key, scanJob.cap, scanJob.yellow, scanJob.orange)
+    zoneCounts[scanJob.itemID] = zones
+    greenPosted[scanJob.itemID] = zones.green
+    scanJob = nil
+    scanPos = scanPos + 1
+    RefreshEconomy()
+    C_Timer.After(0.25, ScanNext)
+end
+
+local function OnCommodityQuote(unitPrice, totalPrice)
+    local job = buyJob
+    if not job or not C_AuctionHouse then return end
+    if type(unitPrice) ~= "number" or unitPrice > job.cap or (totalPrice or 0) > GetMoney() then
+        pcall(C_AuctionHouse.CancelCommoditiesPurchase)
+        FinishBuy(job.name .. " " .. L("уже дороже зелёной зоны.", "is above the green zone."))
+        return
+    end
+    local ok, err = pcall(C_AuctionHouse.ConfirmCommoditiesPurchase, job.itemID, job.qty)
+    if not ok then
+        pcall(C_AuctionHouse.CancelCommoditiesPurchase)
+        FinishBuy(job.name .. " " .. tostring(err))
+    end
+end
+
 local function ToggleLists()
     if not listFrame then return end
-    if listFrame:IsShown() then
+    if listFrame:IsShown() and listFrame.mode ~= "economy" then
         listFrame:Hide()
     else
         listFrame:Show()
         listFrame:Raise()
-        ShowListsMode(listFrame.mode or "lists")
+        ShowListsMode("lists")
     end
 end
 
@@ -1511,24 +1897,6 @@ local function EnsureLists()
     title:SetText(L("Холоп", "Holop"))
     local close = CreateFrame("Button", nil, listFrame, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", 2, 2)
-    local tabEconomy = CreateFrame("Button", nil, listFrame, "UIPanelButtonTemplate")
-    tabEconomy:SetSize(120, 22)
-    tabEconomy:SetPoint("TOPRIGHT", -36, -8)
-    tabEconomy:SetFrameLevel(300)
-    tabEconomy:SetText(L("Экономика", "Economy"))
-    tabEconomy:SetScript("OnClick", function()
-        ShowListsMode("economy")
-    end)
-    listFrame.tabEconomy = tabEconomy
-    local tabLists = CreateFrame("Button", nil, listFrame, "UIPanelButtonTemplate")
-    tabLists:SetSize(100, 22)
-    tabLists:SetPoint("RIGHT", tabEconomy, "LEFT", -6, 0)
-    tabLists:SetFrameLevel(300)
-    tabLists:SetText("|cffffd100" .. L("Списки", "Lists") .. "|r")
-    tabLists:SetScript("OnClick", function()
-        ShowListsMode("lists")
-    end)
-    listFrame.tabLists = tabLists
     local economy = CreateFrame("Frame", nil, listFrame)
     economy:SetPoint("TOPLEFT", 16, -40)
     economy:SetPoint("BOTTOMRIGHT", -16, 40)
@@ -1537,56 +1905,81 @@ local function EnsureLists()
         listFrame.economyOffset = (listFrame.economyOffset or 0) - delta
         RefreshEconomy()
     end)
-    local function ZoneBox(parent, r, g, b)
-        local box = CreateFrame("Frame", nil, parent, "BackdropTemplate")
-        box:SetSize(168, 40)
-        box:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8x8" })
-        box:SetBackdropColor(r, g, b, 0.95)
-        box.caption = box:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        box.caption:SetPoint("TOP", 0, -4)
-        box.caption:SetTextColor(1, 1, 1)
-        box.price = box:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        box.price:SetPoint("BOTTOM", 0, 4)
-        box.price:SetTextColor(1, 0.95, 0.8)
-        return box
-    end
+    local legend = economy:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    legend:SetPoint("TOPLEFT", 0, 0)
+    legend:SetPoint("RIGHT", economy, "RIGHT", 0, 0)
+    legend:SetJustifyH("LEFT")
+    legend:SetWordWrap(true)
+    legend:SetHeight(28)
+    legend:SetText(L("Рентабельность — доля прибыли: насколько продажа торговцу выгоднее затрат на аукционе.", "Return is the share of profit: how much selling to a vendor beats the auction cost."))
+    local legendQty = economy:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    legendQty:SetPoint("TOPLEFT", 0, -30)
+    legendQty:SetPoint("RIGHT", economy, "RIGHT", 0, 0)
+    legendQty:SetJustifyH("LEFT")
+    legendQty:SetWordWrap(false)
+    legendQty:SetText(L("|cff3cf03cЗелёное|r — рентабельность выше 30%.  |cffffcc33Жёлтое|r — 15–30%.  |cffff7f24Оранжевое|r — меньше 15%, ещё плюс.  |cffff5544Красное|r — ноль и убыток.", "|cff3cf03cGreen|r — return above 30%.  |cffffcc33Yellow|r — 15–30%.  |cffff7f24Orange|r — under 15%, still a profit.  |cffff5544Red|r — break-even or a loss."))
     economy.rows = {}
-    for i = 1, 8 do
+    for i = 1, 15 do
         local row = CreateFrame("Frame", nil, economy)
-        row:SetSize(820, 56)
-        row:SetPoint("TOPLEFT", 0, -((i - 1) * 58))
+        row:SetSize(820, 26)
+        row:SetPoint("TOPLEFT", 0, -50 - ((i - 1) * 28))
         row.bg = row:CreateTexture(nil, "BACKGROUND")
         row.bg:SetAllPoints()
-        row.bg:SetColorTexture(0.08, 0.06, 0.05, 0.85)
+        row.bg:SetColorTexture(i % 2 == 0 and 0.11 or 0.07, 0.08, 0.06, 0.9)
         row.bar = row:CreateTexture(nil, "ARTWORK")
         row.bar:SetPoint("TOPLEFT", 0, 0)
         row.bar:SetPoint("BOTTOMLEFT", 0, 0)
-        row.bar:SetWidth(6)
+        row.bar:SetWidth(4)
         row.bar:SetColorTexture(0.55, 0.43, 0.25, 1)
         row.icon = row:CreateTexture(nil, "OVERLAY")
-        row.icon:SetSize(36, 36)
-        row.icon:SetPoint("LEFT", 12, 0)
-        row.title = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        row.title:SetPoint("TOPLEFT", 56, -6)
-        row.title:SetWidth(210)
+        row.icon:SetSize(20, 20)
+        row.icon:SetPoint("LEFT", 8, 0)
+        row.title = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.title:SetPoint("LEFT", 32, 0)
+        row.title:SetWidth(170)
         row.title:SetJustifyH("LEFT")
         row.title:SetWordWrap(false)
         row.title:SetTextColor(0.95, 0.9, 0.75)
-        row.detail = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.detail:SetPoint("BOTTOMLEFT", 56, 8)
-        row.detail:SetWidth(210)
-        row.detail:SetJustifyH("LEFT")
-        row.detail:SetWordWrap(false)
-        row.now = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.now:SetPoint("TOPLEFT", 56, -22)
-        row.now:SetWidth(210)
-        row.now:SetJustifyH("LEFT")
-        row.green = ZoneBox(row, 0.12, 0.42, 0.16)
-        row.green:SetPoint("LEFT", 280, 0)
-        row.yellow = ZoneBox(row, 0.48, 0.38, 0.08)
-        row.yellow:SetPoint("LEFT", row.green, "RIGHT", 6, 0)
-        row.red = ZoneBox(row, 0.48, 0.12, 0.1)
-        row.red:SetPoint("LEFT", row.yellow, "RIGHT", 6, 0)
+        row.price = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.price:SetPoint("LEFT", 206, 0)
+        row.price:SetWidth(120)
+        row.price:SetJustifyH("LEFT")
+        row.price:SetTextColor(0.45, 0.95, 0.45)
+        row.zones = {}
+        local zoneColors = {
+            { 0.24, 0.94, 0.24 },
+            { 1, 0.8, 0.2 },
+            { 1, 0.5, 0.14 },
+            { 1, 0.33, 0.27 },
+        }
+        for zoneIndex, color in ipairs(zoneColors) do
+            local cell = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            cell:SetPoint("LEFT", 330 + ((zoneIndex - 1) * 46), 0)
+            cell:SetWidth(42)
+            cell:SetJustifyH("RIGHT")
+            cell:SetTextColor(color[1], color[2], color[3])
+            cell:SetText("—")
+            row.zones[zoneIndex] = cell
+        end
+        row.qty = CreateFrame("EditBox", nil, row, "InputBoxTemplate")
+        row.qty:SetSize(52, 18)
+        row.qty:SetPoint("LEFT", 530, 0)
+        row.qty:SetAutoFocus(false)
+        row.qty:SetNumeric(true)
+        row.qty:SetMaxLetters(5)
+        row.qty:SetScript("OnTextChanged", function(box)
+            if row.filling or not row.itemID or not box:HasFocus() then return end
+            qtyWant[row.itemID] = tonumber(box:GetText())
+        end)
+        row.qty:SetScript("OnEnterPressed", function(box) box:ClearFocus() end)
+        row.qty:SetScript("OnEscapePressed", function(box) box:ClearFocus() end)
+        row.buy = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        row.buy:SetSize(78, 20)
+        row.buy:SetPoint("LEFT", 592, 0)
+        row.buy:SetText(L("Купить", "Buy"))
+        row.buy:SetScript("OnClick", function()
+            BuyOneGreen(row.itemID, tonumber(row.qty:GetText()) or 0, row.greenCap, row.title:GetText())
+        end)
         row:EnableMouse(true)
         row:SetScript("OnEnter", function(self)
             if not (self.itemID and GameTooltip and GameTooltip.SetItemByID) then return end
@@ -1603,11 +1996,11 @@ local function EnsureLists()
     economy:Hide()
     listFrame.economy = economy
     local economyNote = listFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    economyNote:SetPoint("BOTTOMLEFT", 14, 14)
+    economyNote:SetPoint("BOTTOMLEFT", 460, 16)
     economyNote:SetPoint("RIGHT", listFrame, "RIGHT", -14, 0)
     economyNote:SetJustifyH("LEFT")
     economyNote:SetWordWrap(false)
-    economyNote:SetText(L("Зелёная — выше 20%. Жёлтая — от 0 до 20%. Красная — 0 и ниже. Шеф-повар уже в выходе. «Сейчас» — Auctionator.", "Green is above 20%. Yellow is 0 to 20%. Red is 0 or less. Chef is already in the yield. “Now” is Auctionator."))
+    economyNote:SetText("")
     economyNote:Hide()
     listFrame.economyNote = economyNote
     listFrame.columns.craft = MakeColumn(listFrame, "craft", L("Производить", "Produce"), "TOPLEFT")
@@ -1619,6 +2012,59 @@ local function EnsureLists()
     dump:SetFrameLevel(300)
     dump:SetText(L("В чат", "To chat"))
     listFrame.dump = dump
+    local search = CreateFrame("Button", nil, listFrame, "UIPanelButtonTemplate")
+    search:SetSize(120, 22)
+    search:SetPoint("BOTTOMLEFT", 14, 12)
+    search:SetFrameLevel(300)
+    search:SetText(L("Искать", "Search"))
+    search:SetScript("OnClick", SearchAuctionList)
+    search:Hide()
+    listFrame.search = search
+    local refresh = CreateFrame("Button", nil, listFrame)
+    refresh:SetSize(22, 22)
+    refresh:SetPoint("TOPRIGHT", -34, -8)
+    refresh:SetFrameLevel(400)
+    local refreshIcon = refresh:CreateTexture(nil, "ARTWORK")
+    refreshIcon:SetAllPoints()
+    refreshIcon:SetTexture("Interface\\Buttons\\UI-RefreshButton")
+    local refreshAnim = refreshIcon:CreateAnimationGroup()
+    local refreshSpin = refreshAnim:CreateAnimation("Rotation")
+    refreshSpin:SetDegrees(-360)
+    refreshSpin:SetDuration(0.9)
+    refreshSpin:SetOrigin("CENTER", 0, 0)
+    refreshAnim:SetLooping("REPEAT")
+    refresh:SetScript("OnClick", function()
+        StartGreenScan(false, true)
+    end)
+    refresh:Hide()
+    listFrame.refresh = refresh
+    listFrame.refreshAnim = refreshAnim
+    local autoTimer = listFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    autoTimer:SetPoint("RIGHT", refresh, "LEFT", -8, 0)
+    autoTimer:SetTextColor(0.95, 0.85, 0.45)
+    autoTimer:SetText("")
+    autoTimer:Hide()
+    listFrame.autoTimer = autoTimer
+    local autoLabel = listFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    autoLabel:SetPoint("RIGHT", autoTimer, "LEFT", -6, 0)
+    autoLabel:SetText(L("Авто", "Auto"))
+    autoLabel:Hide()
+    listFrame.autoLabel = autoLabel
+    local autoCheck = CreateFrame("CheckButton", nil, listFrame, "UICheckButtonTemplate")
+    autoCheck:SetSize(24, 24)
+    autoCheck:SetPoint("RIGHT", autoLabel, "LEFT", -2, 0)
+    autoCheck:SetFrameLevel(300)
+    autoCheck:SetChecked(DB().autoScan == true)
+    autoCheck:SetScript("OnClick", function(self)
+        DB().autoScan = self:GetChecked() and true or false
+        if DB().autoScan then
+            autoNext = GetTime()
+            EnsureAutoTicker()
+        end
+        UpdateAutoTimer()
+    end)
+    autoCheck:Hide()
+    listFrame.autoCheck = autoCheck
     dump:SetScript("OnClick", DumpLists)
 end
 
@@ -1663,6 +2109,7 @@ local MERCHANT_GAP = 0.4
 local merchantJob
 local merchantTicker
 local merchantPlanned
+local buyOnce = false
 
 local function StackSize(itemID, merchantStack)
     if C_Item and C_Item.GetItemMaxStackSizeByID then
@@ -1785,13 +2232,22 @@ local function DebugMerchant()
     end
 end
 
+local function MerchantCount()
+    if not GetMerchantNumItems then return 0 end
+    local ok, value = pcall(GetMerchantNumItems)
+    if ok and type(value) == "number" and value > 0 then
+        return value
+    end
+    return 0
+end
+
 local function MerchantIsOpen()
+    if MerchantCount() > 0 then return true end
     if MerchantFrame and MerchantFrame.IsShown then
         local ok, shown = pcall(MerchantFrame.IsShown, MerchantFrame)
-        if ok then return shown and true or false end
+        if ok and shown then return true end
     end
-    local num = GetMerchantNumItems and GetMerchantNumItems() or 0
-    return type(num) == "number" and num > 0
+    return false
 end
 
 local function StopMerchant(silent)
@@ -1894,7 +2350,11 @@ local function StepMerchant()
     if job.phase == "settle" then
         job.settle = job.settle - 1
         if job.settle > 0 then return end
-        job.plans, job.missed = BuildBuyPlan()
+        if job.buy then
+            job.plans, job.missed = BuildBuyPlan()
+        else
+            job.plans, job.missed = {}, nil
+        end
         job.planIndex = 1
         job.phase = "buy"
     end
@@ -1925,12 +2385,43 @@ local function StepMerchant()
     end
 end
 
-local function StartMerchantWork()
+local function BeginBuyNow()
+    if merchantTicker then
+        merchantTicker:Cancel()
+        merchantTicker = nil
+    end
+    merchantJob = nil
+    if MerchantCount() < 1 then
+        buyOnce = true
+        Print(L("Прилавок ещё пуст. Закуплю, как появится товар.", "The counter is still empty. I'll buy when the goods appear."))
+        return
+    end
+    buyOnce = false
+    merchantPlanned = true
+    merchantJob = { phase = "settle", settle = 1, touched = {}, sold = 0, bought = 0, buy = true }
+    merchantTicker = C_Timer.NewTicker(MERCHANT_GAP, StepMerchant)
+    Print(L("Закупаю.", "Buying."))
+    StepMerchant()
+end
+
+RequestRestock = function()
+    if merchantJob and (merchantJob.phase == "sell" or merchantJob.phase == "settle") then
+        merchantJob.buy = true
+        buyOnce = false
+        Print(L("Закупаю.", "Buying."))
+        return
+    end
+    BeginBuyNow()
+end
+
+function StartMerchantWork()
     if merchantJob or merchantPlanned then return end
     local num = GetMerchantNumItems and GetMerchantNumItems() or 0
     if type(num) ~= "number" or num < 1 then return end
+    local doBuy = DB().alwaysRestock == true or buyOnce
+    buyOnce = false
     merchantPlanned = true
-    merchantJob = { phase = "sell", touched = {}, sold = 0, bought = 0 }
+    merchantJob = { phase = "sell", touched = {}, sold = 0, bought = 0, buy = doBuy }
     merchantTicker = C_Timer.NewTicker(MERCHANT_GAP, StepMerchant)
     StepMerchant()
 end
@@ -2010,18 +2501,11 @@ local function EnsureBar()
     earn:SetPoint("BOTTOMLEFT", 14, 84)
     earn:SetPoint("RIGHT", bar, "RIGHT", -14, 0)
     earn:SetJustifyH("LEFT")
-    earn:SetText(L("Заработаю: ", "I'll earn: ") .. "0")
+    earn:SetText(L("На продажу: ", "For sale: ") .. "0")
     bar.earn = earn
 
-    local spend = bar:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    spend:SetPoint("BOTTOMLEFT", 14, 64)
-    spend:SetPoint("RIGHT", bar, "RIGHT", -14, 0)
-    spend:SetJustifyH("LEFT")
-    spend:SetText(L("Закуплю: ", "I'll buy: ") .. "0")
-    bar.spend = spend
-
     local forecast = bar:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    forecast:SetPoint("BOTTOMLEFT", 14, 44)
+    forecast:SetPoint("BOTTOMLEFT", 14, 64)
     forecast:SetPoint("RIGHT", bar, "RIGHT", -14, 0)
     forecast:SetJustifyH("LEFT")
     forecast:SetText(L("Прогноз: ", "Forecast: ") .. MoneyText(0))
@@ -2029,7 +2513,7 @@ local function EnsureBar()
     bar.forecast = forecast
 
     local start = CreateFrame("Button", nil, bar, "UIPanelButtonTemplate")
-    start:SetSize(84, 22)
+    start:SetSize(70, 22)
     start:SetPoint("BOTTOMLEFT", 14, 12)
     start:SetText(L("Начать", "Start"))
     start:SetScript("OnClick", function()
@@ -2038,18 +2522,26 @@ local function EnsureBar()
     bar.start = start
 
     local stop = CreateFrame("Button", nil, bar, "UIPanelButtonTemplate")
-    stop:SetSize(84, 22)
-    stop:SetPoint("LEFT", start, "RIGHT", 8, 0)
+    stop:SetSize(64, 22)
+    stop:SetPoint("LEFT", start, "RIGHT", 4, 0)
     stop:SetText(L("Стоп", "Stop"))
     stop:SetScript("OnClick", function()
         StopRun(L("Остановился.", "Stopped."))
     end)
 
     local lists = CreateFrame("Button", nil, bar, "UIPanelButtonTemplate")
-    lists:SetSize(84, 22)
-    lists:SetPoint("LEFT", stop, "RIGHT", 8, 0)
+    lists:SetSize(78, 22)
+    lists:SetPoint("LEFT", stop, "RIGHT", 4, 0)
     lists:SetText(L("Списки", "Lists"))
     lists:SetScript("OnClick", ToggleLists)
+
+    local economyButton = CreateFrame("Button", nil, bar, "UIPanelButtonTemplate")
+    economyButton:SetSize(118, 22)
+    economyButton:SetPoint("LEFT", lists, "RIGHT", 4, 0)
+    economyButton:SetText(L("Экономика", "Economy"))
+    economyButton:SetScript("OnClick", function()
+        OpenEconomy(false)
+    end)
 
     bar:SetShown(ProfessionOpen())
 end
@@ -2065,17 +2557,41 @@ events:RegisterEvent("PLAYER_REGEN_DISABLED")
 events:RegisterEvent("MERCHANT_SHOW")
 events:RegisterEvent("MERCHANT_UPDATE")
 events:RegisterEvent("MERCHANT_CLOSED")
+pcall(events.RegisterEvent, events, "AUCTION_HOUSE_SHOW")
+pcall(events.RegisterEvent, events, "COMMODITY_SEARCH_RESULTS_UPDATED")
+pcall(events.RegisterEvent, events, "ITEM_SEARCH_RESULTS_UPDATED")
+pcall(events.RegisterEvent, events, "COMMODITY_PRICE_UPDATED")
+pcall(events.RegisterEvent, events, "COMMODITY_PURCHASE_SUCCEEDED")
+pcall(events.RegisterEvent, events, "COMMODITY_PURCHASE_FAILED")
+pcall(events.RegisterEvent, events, "AUCTION_HOUSE_THROTTLED")
 events:RegisterEvent("GET_ITEM_INFO_RECEIVED")
 events:RegisterEvent("BAG_UPDATE")
 pcall(events.RegisterEvent, events, "TRAIT_CONFIG_UPDATED")
 pcall(events.RegisterEvent, events, "TRAIT_NODE_CHANGED")
-events:SetScript("OnEvent", function(_, event, arg1, _, spellID)
+events:SetScript("OnEvent", function(_, event, arg1, arg2, spellID)
     if event == "ADDON_LOADED" and arg1 == addonName then
         DB()
         EnsureLists()
         EnsureBar()
     elseif event == "ADDON_LOADED" and arg1 == "Blizzard_Professions" then
         EnsureBar()
+    elseif event == "AUCTION_HOUSE_SHOW" then
+        C_Timer.After(0.2, function() OpenEconomy(true) end)
+    elseif event == "COMMODITY_SEARCH_RESULTS_UPDATED" then
+        OnAuctionSearch(arg1)
+    elseif event == "ITEM_SEARCH_RESULTS_UPDATED" then
+        OnAuctionSearch(nil, arg1)
+    elseif event == "COMMODITY_PRICE_UPDATED" then
+        OnCommodityQuote(arg1, arg2)
+    elseif event == "COMMODITY_PURCHASE_SUCCEEDED" then
+        if buyJob then FinishBuy(buyJob.name .. " +" .. buyJob.qty) end
+    elseif event == "COMMODITY_PURCHASE_FAILED" then
+        if buyJob then
+            pcall(C_AuctionHouse.CancelCommoditiesPurchase)
+            FinishBuy(buyJob.name .. " " .. L("не выкупилось.", "was not bought."))
+        end
+    elseif event == "AUCTION_HOUSE_THROTTLED" then
+        if scanJob then C_Timer.After(0.8, ScanNext) end
     elseif event == "MERCHANT_SHOW" or event == "MERCHANT_UPDATE" then
         C_Timer.After(0.3, StartMerchantWork)
     elseif event == "MERCHANT_CLOSED" then
