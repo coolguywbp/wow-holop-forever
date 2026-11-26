@@ -1659,7 +1659,10 @@ local function ContainerItemID(bag, slot)
     end
 end
 
-local restockAt = 0
+local MERCHANT_GAP = 0.4
+local merchantJob
+local merchantTicker
+local merchantPlanned
 
 local function StackSize(itemID, merchantStack)
     if C_Item and C_Item.GetItemMaxStackSizeByID then
@@ -1668,10 +1671,19 @@ local function StackSize(itemID, merchantStack)
             return size
         end
     end
-    if type(merchantStack) == "number" and merchantStack > 0 then
+    if type(merchantStack) == "number" and merchantStack > 1 then
         return merchantStack
     end
     return 20
+end
+
+local function BuyChunk(itemID, sale)
+    local stack = StackSize(itemID, sale)
+    local chunk = math.floor(stack / sale) * sale
+    if chunk < sale then
+        chunk = sale
+    end
+    return chunk
 end
 
 local function Remember(itemID)
@@ -1773,48 +1785,69 @@ local function DebugMerchant()
     end
 end
 
-local function SellAndRestock()
-    local num = GetMerchantNumItems and GetMerchantNumItems() or 0
-    if num < 1 then
-        Print("прилавок пуст, покупки нет")
-        return
+local function MerchantIsOpen()
+    if MerchantFrame and MerchantFrame.IsShown then
+        local ok, shown = pcall(MerchantFrame.IsShown, MerchantFrame)
+        if ok then return shown and true or false end
     end
-    if GetTime() - restockAt < 1 then return end
-    restockAt = GetTime()
+    local num = GetMerchantNumItems and GetMerchantNumItems() or 0
+    return type(num) == "number" and num > 0
+end
 
-    local sold, bought = 0, 0
+local function StopMerchant(silent)
+    if merchantTicker then
+        merchantTicker:Cancel()
+        merchantTicker = nil
+    end
+    local job = merchantJob
+    merchantJob = nil
+    if not job then return end
+    if not silent then
+        if job.missed and #job.missed > 0 then
+            Print(L("У торговца нет: ", "Not on this vendor: ") .. table.concat(job.missed, ", "))
+        elseif job.sold > 0 or job.bought > 0 then
+            Print(L("Продал " .. job.sold .. ", докупил " .. job.bought .. ".", "Sold " .. job.sold .. ", bought " .. job.bought .. "."))
+        end
+    end
+    pcall(RefreshMoney)
+end
+
+local function NextSell(job)
     local use = C_Container and C_Container.UseContainerItem
-    if use then
-        for bag = 0, 5 do
-            for slot = 1, ContainerSlots(bag) do
-                local itemID, locked = ContainerItemID(bag, slot)
-                if itemID and not locked and OnSellList(itemID) then
-                    if pcall(use, bag, slot) then
-                        sold = sold + 1
-                    end
+    if not use then return false end
+    for bag = 0, 5 do
+        for slot = 1, ContainerSlots(bag) do
+            local itemID, locked = ContainerItemID(bag, slot)
+            local key = bag .. ":" .. slot
+            if itemID and not locked and OnSellList(itemID) and job.touched[key] ~= itemID then
+                if pcall(use, bag, slot) then
+                    job.touched[key] = itemID
+                    job.sold = job.sold + 1
                 end
+                return true
             end
         end
     end
+    return false
+end
 
-    local missed = {}
+local function BuildBuyPlan()
+    local num = GetMerchantNumItems and GetMerchantNumItems() or 0
     local wanted = {}
-    for key, amount in pairs(DB().restock) do
+    for key, amount in pairs(DB().restock or {}) do
         local id = tonumber(key)
         local n = tonumber(amount)
         if id and n and n > 0 then
             wanted[id] = n
         end
     end
-
+    local plans = {}
     for index = 1, num do
         local info = MerchantItem(index)
         local itemID = MerchantItemID(index, info)
         if itemID and info and type(info.price) == "number" and info.price > 0 then
             local sale = info.stackCount
-            if type(sale) ~= "number" or sale < 1 then
-                sale = 1
-            end
+            if type(sale) ~= "number" or sale < 1 then sale = 1 end
             DB().buyPrice = DB().buyPrice or {}
             DB().buyPrice[itemID] = math.floor(info.price / sale)
         end
@@ -1824,57 +1857,82 @@ local function SellAndRestock()
             local have = ItemCount(itemID)
             local need = want - have
             if not currencyOnly and need > 0 then
-                -- Bag count updates after the vendor messages, so it cannot be used to see if a buy landed.
-                -- Order the whole remainder. Icon number is one purchase (water is 5, spices are 1).
                 local sale = info.stackCount
-                if type(sale) ~= "number" or sale < 1 then
-                    sale = 1
-                end
-                local stack = StackSize(itemID, sale)
-                local chunk = math.floor(stack / sale) * sale
-                if chunk < sale then
-                    chunk = sale
-                end
-                local left = math.ceil(need / sale) * sale
-                local ordered = 0
-                while left > 0 do
-                    local batch = math.min(left, chunk)
-                    if not BuyFromMerchant(index, batch) then
-                        if batch == sale then
-                            break
-                        end
-                        batch = sale
-                        if not BuyFromMerchant(index, batch) then
-                            break
-                        end
-                    end
-                    left = left - batch
-                    ordered = ordered + batch
-                end
-                if ordered > 0 then
-                    bought = bought + ordered
-                    wanted[itemID] = nil
-                    Print(ItemName(itemID) .. " +" .. ordered)
-                else
-                    Print(ItemName(itemID) .. " " .. L("не купилось", "was not bought"))
-                    wanted[itemID] = nil
-                end
-            elseif need <= 0 then
-                wanted[itemID] = nil
-                Print(ItemName(itemID) .. " " .. have .. "/" .. want)
+                if type(sale) ~= "number" or sale < 1 then sale = 1 end
+                plans[#plans + 1] = {
+                    index = index,
+                    sale = sale,
+                    chunk = BuyChunk(itemID, sale),
+                    left = math.ceil(need / sale) * sale,
+                    name = ItemName(itemID),
+                }
             end
+            wanted[itemID] = nil
         end
     end
-
+    local missed = {}
     for itemID in pairs(wanted) do
         missed[#missed + 1] = ItemName(itemID)
     end
-    if #missed > 0 then
-        Print(L("У торговца нет: ", "Not on this vendor: ") .. table.concat(missed, ", "))
-    elseif sold > 0 or bought > 0 then
-        Print(L("Продал " .. sold .. ", докупил " .. bought .. ".", "Sold " .. sold .. ", bought " .. bought .. "."))
+    return plans, missed
+end
+
+local function StepMerchant()
+    local job = merchantJob
+    if not job then return end
+    if not MerchantIsOpen() then
+        merchantPlanned = false
+        StopMerchant(true)
+        return
     end
-    pcall(RefreshMoney)
+    if job.phase == "sell" then
+        if NextSell(job) then return end
+        job.phase = "settle"
+        job.settle = 3
+        return
+    end
+    if job.phase == "settle" then
+        job.settle = job.settle - 1
+        if job.settle > 0 then return end
+        job.plans, job.missed = BuildBuyPlan()
+        job.planIndex = 1
+        job.phase = "buy"
+    end
+    local plan = job.plans and job.plans[job.planIndex]
+    if not plan then
+        StopMerchant(false)
+        return
+    end
+    if plan.left <= 0 then
+        if plan.ordered and plan.ordered > 0 then
+            Print(plan.name .. " +" .. plan.ordered)
+        end
+        job.planIndex = job.planIndex + 1
+        return
+    end
+    local batch = math.min(plan.left, plan.chunk or plan.sale)
+    if BuyFromMerchant(plan.index, batch) then
+        plan.fails = 0
+        plan.left = plan.left - batch
+        plan.ordered = (plan.ordered or 0) + batch
+        job.bought = job.bought + batch
+    else
+        plan.fails = (plan.fails or 0) + 1
+        if plan.fails >= 3 then
+            Print(plan.name .. " " .. L("не купилось", "was not bought"))
+            plan.left = 0
+        end
+    end
+end
+
+local function StartMerchantWork()
+    if merchantJob or merchantPlanned then return end
+    local num = GetMerchantNumItems and GetMerchantNumItems() or 0
+    if type(num) ~= "number" or num < 1 then return end
+    merchantPlanned = true
+    merchantJob = { phase = "sell", touched = {}, sold = 0, bought = 0 }
+    merchantTicker = C_Timer.NewTicker(MERCHANT_GAP, StepMerchant)
+    StepMerchant()
 end
 
 local function EnsureBar()
@@ -2006,6 +2064,7 @@ events:RegisterUnitEvent("UNIT_SPELLCAST_INTERRUPTED", "player")
 events:RegisterEvent("PLAYER_REGEN_DISABLED")
 events:RegisterEvent("MERCHANT_SHOW")
 events:RegisterEvent("MERCHANT_UPDATE")
+events:RegisterEvent("MERCHANT_CLOSED")
 events:RegisterEvent("GET_ITEM_INFO_RECEIVED")
 events:RegisterEvent("BAG_UPDATE")
 pcall(events.RegisterEvent, events, "TRAIT_CONFIG_UPDATED")
@@ -2018,7 +2077,14 @@ events:SetScript("OnEvent", function(_, event, arg1, _, spellID)
     elseif event == "ADDON_LOADED" and arg1 == "Blizzard_Professions" then
         EnsureBar()
     elseif event == "MERCHANT_SHOW" or event == "MERCHANT_UPDATE" then
-        C_Timer.After(0.2, SellAndRestock)
+        C_Timer.After(0.3, StartMerchantWork)
+    elseif event == "MERCHANT_CLOSED" then
+        merchantPlanned = false
+        if merchantTicker then
+            merchantTicker:Cancel()
+            merchantTicker = nil
+        end
+        merchantJob = nil
     elseif event == "GET_ITEM_INFO_RECEIVED" then
         RefreshLists()
         if listFrame and listFrame:IsShown() and listFrame.mode == "economy" then
