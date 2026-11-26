@@ -1,0 +1,15 @@
+## Interface: 16001
+## Title: Holop
+## Title-ruRU: Холоп
+## Notes: Crafts for you, buys materials from vendors, sells the goods, and shows which auction prices still profit.
+## Notes-ruRU: Крафтит за вас, закупает материалы у торговца, продаёт продукцию и подсказывает выгодные цены аукциона.
+## Author: megatronus
+## Version: 0.7.1
+## IconTexture: Interface\AddOns\Holop\face.png
+## SavedVariables: HolopDB
+## Category: Professions
+## Category-ruRU: Профессии
+## AllowLoadGameType: forever
+## ExcludeLoadGameType: standard, classic
+
+Holop.lua
