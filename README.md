@@ -1,7 +1,7 @@
 # Холоп
 
 <p align="center">
-  <img src="face-forge.png" alt="Холоп ехидно смотрит" width="320">
+  <img src="face.png" alt="Холоп" width="320">
 </p>
 
 Аддон для выгодного крафта в World of Warcraft: Forever.
@@ -43,6 +43,20 @@
 
 - World of Warcraft: Forever, интерфейс 16001.
 - Auctionator нужен только для строки **сейчас** на аукционе. Потолок цены считается и без него.
+
+## Как выглядит
+
+Окно у профессии: очередь, продажа и прогноз.
+
+<img src="screens/craft.png" alt="Окно Холопа у профессии" width="420">
+
+Списки: производить, закупать, продавать.
+
+<img src="screens/lists.png" alt="Списки Холопа" width="720">
+
+Экономика: что купить на аукционе и до какой цены.
+
+<img src="screens/economy.png" alt="Экономика Холопа" width="720">
 
 ## English
 
